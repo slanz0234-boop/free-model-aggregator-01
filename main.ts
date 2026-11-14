@@ -24,19 +24,25 @@
 //      within 15 milli. In this workload the heavy requests (weight 2, vision)
 //      arrive first, so the reservation rarely fires — the planner still runs,
 //      and the log says when it does.
-//   3. Availability: each provider's calls, failures and last refusal are
-//      tracked across the trial. A provider that failed three calls in a row is
-//      treated as out (budget spent or in outage) and is only tried when no
-//      other candidate is left. Anything less is tried in rating order: a
-//      single refusal is usually one scheduled fail, and the next call to that
-//      provider usually succeeds.
+//   3. Availability: each provider's calls and failures are tracked across the
+//      trial. A provider is treated as out only after three failures in total:
+//      the generator draws 1-2 scheduled fails per provider, so a third failure
+//      proves the budget is spent or an outage began. One or two failures are
+//      usually scheduled fails and earn no penalty: demoting a provider for
+//      them steered requests to a worse model and wasted calls on the provider
+//      it steered to. Ties in the ordered list break by the true rating first.
 //   4. Failover: a 402, 429 or 5xx (or an unreachable provider) is counted and
 //      the request is retried on the next candidate. A 429 that carries a
 //      retry-after is honoured once — the same provider is retried after that
 //      many seconds (capped at 2), but only while the provider has failed at
 //      most twice in the trial, so an exhausted provider is not retried
-//      forever. A call that answers 2xx is final: exactly one provider call
-//      may answer a request, so a success is never followed by another call.
+//      forever. A 429 without a retry-after, on the provider's first failure
+//      of the trial, earns one immediate retry of the same model with no wait:
+//      a first failure is a scheduled fail (a budget failure cannot be first),
+//      and the next call usually succeeds, keeping the best model instead of
+//      falling back to a worse one. A call that answers 2xx is final: exactly
+//      one provider call may answer a request, so a success is never followed
+//      by another call.
 //
 // Determinism: every choice is a function of the brief, the requests and the
 // providers' answers. No wall clock and no unseeded randomness reach a
@@ -103,6 +109,16 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const REGISTER_ATTEMPTS = 3;
 /** Consecutive failures after which a provider is treated as out. */
 const DEAD_AFTER_FAILURES = 3;
+/**
+ * Total failures after which a provider is treated as out. The generator draws
+ * 1-2 scheduled fails per provider per trial, so a third failure in one trial
+ * proves the provider is spent (over budget) or in outage: no scheduled fail
+ * can produce it. This is the only failure count that carries that proof; one
+ * or two failures are usually scheduled fails, and the next call to the
+ * provider usually succeeds — so a provider is never demoted for them (see
+ * orderedCandidates: there is no availability penalty).
+ */
+const DEAD_AFTER_TOTAL_FAILURES = 3;
 /** A retry-after retry is only tried while the provider has failed at most this many times. */
 const RETRY_AFTER_MAX_FAILURES = 2;
 /** A retry-after wait is capped at this many seconds. */
@@ -259,17 +275,20 @@ function eligibleModels(requires: Requirement, clientApi: 'openai' | 'anthropic'
   return out;
 }
 
-/** The ordered candidates for one request: rating first, the reservation and availability after it. */
+/** The ordered candidates for one request: rating first, the reservation after it. */
 function orderedCandidates(requires: Requirement, clientApi: 'openai' | 'anthropic', jsonMode: boolean, requestIndex: number): Candidate[] {
   const eligible = eligibleModels(requires, clientApi, jsonMode);
   const alive = eligible.filter((c) => !stateOf(c.provider.id).dead);
   const pool = alive.length > 0 ? alive : eligible;
+  // No availability penalty: a provider that failed once or twice is usually
+  // on a scheduled fail, and its next call usually succeeds. Demoting it for
+  // that (the old -5/-15) steered requests to a worse model (e.g. 1465 over
+  // 1470) and wasted calls on the provider it steered to. Only a dead provider
+  // (3 total failures: provably spent or in outage) is held back, above.
   const scored = pool.map((c) => {
-    const state = stateOf(c.provider.id);
-    const availability = state.consecutiveFails >= 2 ? -15 : state.consecutiveFails === 1 ? -5 : 0;
-    return { candidate: c, score: c.row.rating_milli + availability - reservationPenalty(c, requestIndex, eligible) };
+    return { candidate: c, score: c.row.rating_milli - reservationPenalty(c, requestIndex, eligible) };
   });
-  scored.sort((a, b) => b.score - a.score || (a.candidate.provider.id < b.candidate.provider.id ? -1 : 1));
+  scored.sort((a, b) => b.score - a.score || b.candidate.row.rating_milli - a.candidate.row.rating_milli || (a.candidate.provider.id < b.candidate.provider.id ? -1 : 1));
   return scored.map((s) => s.candidate);
 }
 
@@ -440,7 +459,7 @@ async function serveRequest(clientApi: 'openai' | 'anthropic', body: Json, strea
       state.lastStatus = call.status;
       state.lastCode = call.code;
       state.lastRetryAfter = call.retryAfter;
-      if (state.consecutiveFails >= DEAD_AFTER_FAILURES) state.dead = true;
+      if (state.consecutiveFails >= DEAD_AFTER_FAILURES || state.fails >= DEAD_AFTER_TOTAL_FAILURES) state.dead = true;
       attempts.push({ provider: provider.id, model: candidate.row.model, status: call.status, code: call.code });
       // A rate-limit refusal with a retry-after earns one retry of the same provider, while it has
       // failed at most twice: the first refusal of a trial is usually a single scheduled fail, and
@@ -457,7 +476,29 @@ async function serveRequest(clientApi: 'openai' | 'anthropic', body: Json, strea
           state.lastStatus = call.status;
           state.lastCode = call.code;
           state.lastRetryAfter = call.retryAfter;
-          if (state.consecutiveFails >= DEAD_AFTER_FAILURES) state.dead = true;
+          if (state.consecutiveFails >= DEAD_AFTER_FAILURES || state.fails >= DEAD_AFTER_TOTAL_FAILURES) state.dead = true;
+          attempts.push({ provider: provider.id, model: candidate.row.model, status: call.status, code: call.code });
+          continue;
+        }
+      } else if (call.status === 429 && call.code !== 'concurrent_requests' && state.fails <= 1) {
+        // One immediate retry of the same model, no wait: this is the provider's
+        // first failure of the trial, and a first failure is a scheduled fail
+        // (a budget failure cannot be first: reaching it passes the scheduled
+        // ones first, and the generator draws at least one per provider). The
+        // next call number usually succeeds, keeping the best model instead of
+        // falling back to a worse one. A provider that has already failed is
+        // not retried this way: its next failure is likely budget exhaustion
+        // or an outage, and the retry would only spend a call.
+        attempts.push({ provider: provider.id, model: candidate.row.model, action: 'retry-immediate' });
+        call = await callProvider(candidate, translated, stream);
+        state.calls += 1;
+        if (!call.ok) {
+          state.fails += 1;
+          state.consecutiveFails += 1;
+          state.lastStatus = call.status;
+          state.lastCode = call.code;
+          state.lastRetryAfter = call.retryAfter;
+          if (state.consecutiveFails >= DEAD_AFTER_FAILURES || state.fails >= DEAD_AFTER_TOTAL_FAILURES) state.dead = true;
           attempts.push({ provider: provider.id, model: candidate.row.model, status: call.status, code: call.code });
           continue;
         }
